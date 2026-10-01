@@ -3,8 +3,9 @@ import json
 from collections.abc import Callable
 from typing import Any, TypedDict
 
+from google.api import field_behavior_pb2 as fb
 from google.protobuf.descriptor import Descriptor, FieldDescriptor
-from google.protobuf.json_format import MessageToDict
+from google.protobuf.json_format import MessageToDict, ParseDict, ParseError
 
 
 try:
@@ -274,3 +275,197 @@ def _canonicalize_agent_card(agent_card: AgentCard) -> str:
     # Remove empty values, walking the AgentCard descriptor
     cleaned_dict = _clean_message(card_dict, AgentCard.DESCRIPTOR)
     return canonicalize(cleaned_dict or None)
+
+
+# Candidate for a2aproject/A2A#2122, served-scope reading of section 8.4.1
+# rule 1. It is the reading favored in that discussion, not a decided rule.
+# Nothing above this line changes: the existing signer, verifier and
+# canonicalization keep their behavior.
+#
+# Served scope applies rule 1 only to the fields present in the JSON being
+# signed or verified. A REQUIRED field that is present stays even at its
+# default value. A field declared with the `optional` keyword stays when it is
+# present. Any other field at its default value is dropped. A field absent from
+# the JSON is never added. Parsing into a protobuf message loses the
+# difference between an absent field and one at its default, so this path
+# works on the JSON as received.
+
+
+def _is_required(field: FieldDescriptor) -> bool:
+    """Returns True if the field carries google.api.field_behavior = REQUIRED."""
+    return fb.REQUIRED in field.GetOptions().Extensions[fb.field_behavior]  # type: ignore[index]  # ty: ignore[invalid-argument-type]
+
+
+def _has_optional_keyword(field: FieldDescriptor) -> bool:
+    """Returns True for a scalar declared with the proto3 `optional` keyword."""
+    return field.message_type is None and field.has_presence
+
+
+def _is_scalar_default(value: Any, field: FieldDescriptor) -> bool:
+    """Returns True if a JSON scalar equals the proto3 default for its field."""
+    if field.type == FieldDescriptor.TYPE_ENUM:
+        default = field.enum_type.values[0]
+        return value in (default.name, default.number)
+    if field.type == FieldDescriptor.TYPE_BOOL:
+        return value is False
+    if field.type in (FieldDescriptor.TYPE_STRING, FieldDescriptor.TYPE_BYTES):
+        return value == ''
+    return value in (0, '0') and not isinstance(value, bool)
+
+
+def _served_required(value: Any, field: FieldDescriptor, depth: int) -> Any:
+    """Keeps a REQUIRED field present in the served JSON, even at its default."""
+    message_type = field.message_type
+    if message_type is None or _is_well_known(message_type):
+        if not _field_is_repeated(field):
+            return value
+        return [
+            cleaned_v
+            for v in value
+            if (cleaned_v := _clean_empty(v, depth + 1)) is not None
+        ]
+    if _is_map(field):
+        return _clean_field(value, field, depth) or {}
+    if not _field_is_repeated(field):
+        return _served_message(value, message_type, depth)
+    return [
+        cleaned_v
+        for v in value
+        if (cleaned_v := _served_message(v, message_type, depth + 1))
+    ]
+
+
+def _served_field(value: Any, field: FieldDescriptor, depth: int) -> Any:
+    """Applies served-scope rule 1 to one field present in the served JSON."""
+    message_type = field.message_type
+    if value is None:
+        result = None
+    elif _is_required(field):
+        result = _served_required(value, field, depth)
+    elif _has_optional_keyword(field):
+        result = value
+    elif message_type is None and not _field_is_repeated(field):
+        result = None if _is_scalar_default(value, field) else value
+    elif message_type is None or _is_well_known(message_type) or _is_map(field):
+        result = _clean_field(value, field, depth)
+    elif _field_is_repeated(field):
+        result = [
+            cleaned_v
+            for v in value
+            if (cleaned_v := _served_message(v, message_type, depth + 1))
+        ] or None
+    else:
+        result = _served_message(value, message_type, depth) or None
+    return result
+
+
+def _served_message(
+    message_dict: dict[str, Any],
+    descriptor: Descriptor | Any,
+    depth: int = 0,
+) -> dict[str, Any]:
+    """Applies served-scope rule 1 to a message as it appears in served JSON."""
+    if depth > MAX_DEPTH:
+        raise CanonicalizationError(
+            f'nesting exceeds the maximum depth of {MAX_DEPTH}'
+        )
+    if not isinstance(message_dict, dict):
+        raise CanonicalizationError(
+            f'expected a JSON object for {descriptor.full_name}'
+        )
+    fields: dict[str, FieldDescriptor] = {}
+    for field in descriptor.fields:
+        fields[field.json_name] = field
+        fields[field.name] = field
+    cleaned: dict[str, Any] = {}
+    for key, value in message_dict.items():
+        field = fields.get(key)
+        if field is None:
+            # Not an AgentCard field. This candidate leaves it out of the
+            # signed form, so a passing signature does not cover it. Whether
+            # served scope keeps, drops or rejects such fields is open in
+            # a2aproject/A2A#2122.
+            continue
+        cleaned_value = _served_field(value, field, depth + 1)
+        if cleaned_value is not None:
+            cleaned[key] = cleaned_value
+    return cleaned
+
+
+def canonicalize_served_agent_card(served_card: dict[str, Any]) -> str:
+    """Canonicalizes an Agent Card as served, under the served-scope reading.
+
+    `served_card` is the card JSON as received, before any protobuf parsing.
+    `signatures` is excluded. Fields absent from the input stay absent.
+    """
+    card = {k: v for k, v in served_card.items() if k != 'signatures'}
+    return canonicalize(_served_message(card, AgentCard.DESCRIPTOR) or None)
+
+
+def create_served_card_signature_verifier(
+    key_provider: Callable[[str | None, str | None], PyJWK | str | bytes],
+    algorithms: list[str],
+) -> Callable[..., None]:
+    """Creates a verifier for an Agent Card as served, under served scope.
+
+    The returned function takes the card JSON exactly as received and,
+    optionally, the AgentCard the caller parsed from it. Pass an unmodified
+    copy of the JSON, since `parse_agent_card` changes its input in place.
+    When both are given, the parsed card must equal a fresh parse of the JSON.
+
+    This verifies the canonical representation selected by this candidate.
+    Fields the AgentCard schema does not define are left out of it, so they
+    are not covered by a signature that passes. Only the served-scope form is
+    tried. There is no fallback to another reading.
+    """
+
+    def served_card_verifier(
+        served_card: dict[str, Any],
+        agent_card: AgentCard | None = None,
+    ) -> None:
+        signatures = served_card.get('signatures') or []
+        if not signatures:
+            raise NoSignatureError('AgentCard has no signatures to verify.')
+        try:
+            parsed = ParseDict(
+                served_card, AgentCard(), ignore_unknown_fields=True
+            )
+        except ParseError as e:
+            raise InvalidSignaturesError(
+                'served card does not parse as an AgentCard'
+            ) from e
+        if agent_card is not None and parsed != agent_card:
+            raise InvalidSignaturesError(
+                'parsed AgentCard does not match the served card'
+            )
+        try:
+            canonical_payload = canonicalize_served_agent_card(served_card)
+        except CanonicalizationError as e:
+            raise InvalidSignaturesError(
+                'AgentCard cannot be canonicalized for verification'
+            ) from e
+        encoded_payload = base64url_encode(
+            canonical_payload.encode('utf-8')
+        ).decode('utf-8')
+        for signature in signatures:
+            try:
+                protected = signature['protected']
+                header = json.loads(
+                    base64url_decode(protected.encode('utf-8')).decode('utf-8')
+                )
+                verification_key = key_provider(
+                    header.get('kid'), header.get('jku')
+                )
+                token = (
+                    f'{protected}.{encoded_payload}.{signature["signature"]}'
+                )
+                jwt.decode(
+                    jwt=token, key=verification_key, algorithms=algorithms
+                )
+                break
+            except (PyJWTError, KeyError, TypeError, ValueError):
+                continue
+        else:
+            raise InvalidSignaturesError('No valid signature found')
+
+    return served_card_verifier
