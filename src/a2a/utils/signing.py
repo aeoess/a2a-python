@@ -346,7 +346,23 @@ def _served_field(value: Any, field: FieldDescriptor, depth: int) -> Any:
         result = value
     elif message_type is None and not _field_is_repeated(field):
         result = None if _is_scalar_default(value, field) else value
-    elif message_type is None or _is_well_known(message_type) or _is_map(field):
+    elif _is_map(field):
+        value_type = message_type.fields_by_name['value'].message_type
+        if value_type is None or _is_well_known(value_type):
+            result = _clean_field(value, field, depth)
+        else:
+            # Message values in a map go through the served-scope walker too,
+            # so they get the same name handling as every other message.
+            if not isinstance(value, dict):
+                raise CanonicalizationError(
+                    f'expected a JSON object for {field.full_name}'
+                )
+            result = {
+                k: cleaned_v
+                for k, v in value.items()
+                if (cleaned_v := _served_message(v, value_type, depth + 1))
+            } or None
+    elif message_type is None or _is_well_known(message_type):
         result = _clean_field(value, field, depth)
     elif _field_is_repeated(field):
         result = [
@@ -378,8 +394,20 @@ def _served_message(
         fields[field.json_name] = field
         fields[field.name] = field
     cleaned: dict[str, Any] = {}
+    seen_fields: dict[str, str] = {}
     for key, value in message_dict.items():
         field = fields.get(key)
+        if field is not None:
+            # A field given under both its JSON name and its proto name would
+            # be kept twice in the canonical form while a typed parse keeps
+            # only one, so two readers could see different values.
+            earlier = seen_fields.get(field.full_name)
+            if earlier is not None:
+                raise CanonicalizationError(
+                    f'field {field.full_name} appears as both '
+                    f'{earlier!r} and {key!r}'
+                )
+            seen_fields[field.full_name] = key
         if field is None:
             # Not a field of this message. It is kept exactly as served, with
             # no default handling, so a passing signature covers it

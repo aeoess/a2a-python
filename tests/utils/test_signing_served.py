@@ -192,3 +192,72 @@ def test_verifier_rejects_a_tampered_card(keypair):
     signed['name'] = 'Tampered'
     with pytest.raises(signing.InvalidSignaturesError):
         _verifier(public)(signed)
+
+
+def test_a_field_under_both_its_names_is_refused():
+    card = _card()
+    card['defaultInputModes'] = ['text/plain']
+    card['default_input_modes'] = ['application/json']
+    with pytest.raises(signing.CanonicalizationError):
+        _canon(card)
+
+
+def test_a_nested_field_under_both_its_names_is_refused():
+    card = _card()
+    card['capabilities'] = {
+        'pushNotifications': True,
+        'push_notifications': False,
+    }
+    with pytest.raises(signing.CanonicalizationError):
+        _canon(card)
+
+
+def _card_with_http_auth(auth: dict[str, Any]) -> dict[str, Any]:
+    card = _card()
+    card['securitySchemes'] = {'auth': {'httpAuthSecurityScheme': auth}}
+    return card
+
+
+def test_a_map_value_field_under_both_its_names_is_refused():
+    card = _card_with_http_auth(
+        {'scheme': 'bearer', 'bearerFormat': 'JWT', 'bearer_format': 'opaque'}
+    )
+    with pytest.raises(signing.CanonicalizationError):
+        _canon(card)
+
+
+def test_verifier_rejects_a_signed_card_with_a_duplicate_name_in_a_map(
+    keypair,
+):
+    from a2a.utils._jcs import canonicalize
+
+    private, public = keypair
+    card = _card_with_http_auth(
+        {'scheme': 'bearer', 'bearerFormat': 'JWT', 'bearer_format': 'opaque'}
+    )
+    # Signed over a form that keeps both spellings, as the earlier walker
+    # produced it.
+    signed = _sign(card, private, canonicalize(card))
+    with pytest.raises(signing.InvalidSignaturesError):
+        _verifier(public)(signed)
+
+
+def test_verifier_accepts_the_same_map_value_under_one_name(keypair):
+    private, public = keypair
+    card = _card_with_http_auth({'scheme': 'bearer', 'bearerFormat': 'JWT'})
+    signed = _sign(card, private, signing.canonicalize_served_agent_card(card))
+    _verifier(public)(signed)
+
+
+def test_unknown_empty_member_in_a_map_value_is_kept_and_signed(keypair):
+    private, public = keypair
+    card = _card_with_http_auth(
+        {'scheme': 'bearer', 'bearerFormat': 'JWT', 'extra': []}
+    )
+    canon = _canon(card)
+    assert (
+        canon['securitySchemes']['auth']['httpAuthSecurityScheme']['extra']
+        == []
+    )
+    signed = _sign(card, private, signing.canonicalize_served_agent_card(card))
+    _verifier(public)(signed)
