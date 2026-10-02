@@ -397,6 +397,7 @@ def canonicalize_served_agent_card(served_card: dict[str, Any]) -> str:
 
     `served_card` is the card JSON as received, before any protobuf parsing.
     `signatures` is excluded. Fields absent from the input stay absent.
+    Fields the AgentCard schema does not define are kept exactly as served.
     """
     card = {k: v for k, v in served_card.items() if k != 'signatures'}
     return canonicalize(_served_message(card, AgentCard.DESCRIPTOR) or None)
@@ -414,9 +415,10 @@ def create_served_card_signature_verifier(
     When both are given, the parsed card must equal a fresh parse of the JSON.
 
     This verifies the canonical representation selected by this candidate.
-    Fields the AgentCard schema does not define are left out of it, so they
-    are not covered by a signature that passes. Only the served-scope form is
-    tried. There is no fallback to another reading.
+    Fields the AgentCard schema does not define are kept in it exactly as
+    served, so a signature that passes covers them. The typed parse is used
+    only to validate the card, never as canonicalization input. Only the
+    served-scope form is tried. There is no fallback to another reading.
     """
 
     def served_card_verifier(
