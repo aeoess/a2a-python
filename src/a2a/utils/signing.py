@@ -381,10 +381,10 @@ def _served_message(
     for key, value in message_dict.items():
         field = fields.get(key)
         if field is None:
-            # Not an AgentCard field. This candidate leaves it out of the
-            # signed form, so a passing signature does not cover it. Whether
-            # served scope keeps, drops or rejects such fields is open in
-            # a2aproject/A2A#2122.
+            # Not a field of this message. It is kept exactly as served, with
+            # no default handling, so a passing signature covers it
+            # (unknown-retain, discussed in a2aproject/A2A#2122).
+            cleaned[key] = value
             continue
         cleaned_value = _served_field(value, field, depth + 1)
         if cleaned_value is not None:

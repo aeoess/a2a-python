@@ -84,17 +84,27 @@ def test_other_fields_at_default_are_dropped():
     assert 'examples' not in canon['skills'][0]
 
 
-def test_fields_outside_the_agent_card_schema_are_left_out():
+def test_fields_outside_the_agent_card_schema_are_kept_as_served():
     card = _card()
     card['protocolVersion'] = '0.3.0'
+    card['emptyList'] = []
     card['provider'] = {
         'url': 'https://example.com',
         'organization': 'O',
         'x': 1,
     }
     canon = _canon(card)
-    assert 'protocolVersion' not in canon
-    assert 'x' not in canon['provider']
+    assert canon['protocolVersion'] == '0.3.0'
+    assert canon['emptyList'] == []
+    assert canon['provider']['x'] == 1
+
+
+def test_changing_an_unknown_field_changes_the_canonical_form():
+    card = _card()
+    card['url'] = 'https://a.example'
+    before = _canon(card)
+    card['url'] = 'https://b.example'
+    assert _canon(card) != before
 
 
 def test_signatures_are_excluded_and_input_is_not_mutated():
